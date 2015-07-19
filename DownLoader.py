@@ -2,6 +2,11 @@ import hashlib
 import urllib.request as urllib2
 import sys, math, os, time, json, threading
 
+
+"""
+1:现在实现数据控制和线程控制分离
+2:现在实现线程可控的下载 #TODO：
+"""
 class DownLoader():
     """
     这一个类实现给定的url资源的下载。嗯嗯，资源的多线程下载
@@ -10,7 +15,13 @@ class DownLoader():
         self.url = url
         self.destFile = destFile and self.createDestFile() or destFile
         self.threadNumber = (threadNumber >0 and threadNumber < 16) and threadNumber or 8 #[1,15]
+
         self.threadControl = {}
+        self.threadControl["process"] = {}
+        self.threadControl["thread"] = []
+        self.threadControl["data"]  = []
+        self.threadControl["process"]["dataNumber"] = 0
+        self.threadControl["merge"] = []
         self.threads = []
         self.fileLength = 0
         self.stopDownloading = False
@@ -27,10 +38,6 @@ class DownLoader():
     def stopDownload(self):
         self.stopDownloading = True
 
-    def restartDownload(self):
-        #TODO: write restart method here
-        pass
-
     def createDestFile(self):
         b = self.url.rsplit("/")
         return b[-1] and b[-1] or "file.downloading"
@@ -38,15 +45,14 @@ class DownLoader():
     def initThreadControl(self):
 
         #线程和进程的控制信息的初始化。
-        self.threadControl["process"] = {}
-        self.threadControl["thread"] = []
         result = self.testThreadDownload()
         self.threadControl["process"]["fileLength"] = self.fileLength
 
         #只能单进程下载的文件
         if not result:
             self.threadNumber = 1
-            control = self.generateThreadInfo(0, begin=0, end=self.fileLength-1)
+            dataId = self.initDataControl(1)
+            control = self.generateThreadInfo(0, dataId=dataId)
             self.threadControl["thread"].append(control)
             self.threadControl["process"]["threadNumber"] = self.threadNumber
             self.threadControl["process"]["downloadType"] = "singleThread"
@@ -54,27 +60,36 @@ class DownLoader():
 
         #多进程下载的文件处理
         #对文件进行分割，便于分段下载
-        piece = (self.fileLength-self.threadNumber) / self.threadNumber
+        self.initDataControl(self.threadNumber)
+        for i in range(self.threadNumber):
+            control = self.generateThreadInfo(i, dataId=i)
+            self.threadControl["thread"].append(control)
+        self.threadControl["process"]["threadNumber"] = self.threadNumber
+        self.threadControl["process"]["downloadType"] = "multipleThread"
+        print("control: ", self.threadControl)
+
+    def initDataControl(self,blockNumber):
+        if blockNumber == 1:
+            data = self.generateDataInfo(0, self.fileLength-1)
+            self.threadControl["data"].append(data)
+            self.threadControl["merge"].append(self.threadControl["process"]["dataNumber"])
+            self.threadControl["process"]["dataNumber"] = 1
+            return 0
+
+        #将下载区域初始化等分为 blockNumber 块
+        piece = (self.fileLength-self.threadNumber) / blockNumber
         prePiece = 0
         for i in range(self.threadNumber):
             if i == self.threadNumber-1:
-                control = self.generateThreadInfo(i, begin=int(prePiece), end=self.fileLength-1)
-                self.threadControl["thread"].append(control)
+                data = self.generateDataInfo(begin=int(prePiece), end=self.fileLength-1)
             else:
                 end = prePiece + piece
-                control = self.generateThreadInfo(i, begin=int(prePiece), end=int(end))
+                data = self.generateDataInfo(begin=int(prePiece), end=int(end))
                 prePiece = end + 1
-                self.threadControl["thread"].append(control)
-        self.threadControl["process"]["threadNumber"] = self.threadNumber
-        self.threadControl["process"]["downloadType"] = "singleThread"
-        print("control: ", self.threadControl)
-
-
-    def relocateThreadControl(self):
-        """
-        实现对控制信息的重置操作
-        """
-        pass
+            self.threadControl["data"].append(data)
+            self.threadControl["merge"].append(self.threadControl["process"]["dataNumber"])
+            self.threadControl["process"]["dataNumber"] = self.threadControl["process"]["dataNumber"] + 1
+        return "OK"
 
     def testThreadDownload(self):
         """
@@ -100,7 +115,8 @@ class DownLoader():
         return isThreadDownload
 
     def threadDownloadMethod(self, id, name):
-        info = self.threadControl["thread"][id]
+        dataId = self.threadControl["thread"][id]["dataId"]
+        info = self.threadControl["data"][dataId]
         fd = None
         try:
             header = {"Range":"bytes={0}-{1}".format(str(info["begin"]), str(info["end"]))}    #"Range":"bytes=%1-%2"  '{0},{1}'.format('kzc',18)
@@ -117,13 +133,13 @@ class DownLoader():
         while True:
             #处理 停止下载的事件
             if self.stopDownloading:
-                self.threadControl["thread"][id]["current"] = writeLength
-                self.threadControl["thread"][id]["status"] = "unfinished"
+                self.threadControl["data"][dataId]["current"] = writeLength
+                self.threadControl["data"][dataId]["status"] = "stopped"
                 print("stop execution")
                 return
 
             data = fd.read(4096)
-            totalLength = self.threadControl["thread"][id]["value"] - self.threadControl["thread"][id]["begin"] + 1
+            totalLength = self.threadControl["data"][dataId]["value"] - self.threadControl["data"][dataId]["begin"] + 1
             if not len(data):
                 break
             if writeLength + len(data) > totalLength:
@@ -131,12 +147,12 @@ class DownLoader():
                 data = data[0:sliceLength]
                 file.write(data)
                 writeLength = writeLength + len(data)
-                self.threadControl["thread"][id]["current"] = writeLength
+                self.threadControl["data"][dataId]["current"] = writeLength
                 break
             else:
                 file.write(data)
                 writeLength = writeLength + len(data)
-                self.threadControl["thread"][id]["current"] = writeLength
+                self.threadControl["data"][dataId]["current"] = writeLength
         print("thread:", id, "  write length:", writeLength)
         self.threadControl["thread"][id]["status"] = "finished"
         file.close()
@@ -152,11 +168,13 @@ class DownLoader():
         threading.Timer(1, function=self.testFinishDownloading).start()
 
     #提供thread 下载信息的类
-    def generateThreadInfo(self, id, begin=0, end=0, value=None, disable=False):
-        if not value:
+    def generateThreadInfo(self, id, status="prepared", dataId=None):
+        return {"id":id,"status":"prepared", "dataId":dataId}
+
+    def generateDataInfo(self, begin=0, end=0, value=None, current=0, status="unfinished"):
+        if value == None:
             value = end
-        return {"id":id, "begin": begin, "end": end, "value": value,
-            "disable":disable, "status":"prepared", "current":0}
+        return {"begin": begin, "end": end, "value": value, "status":status, "current":0}
 
     def testFinishDownloading(self):
         print("test finish downloading")
@@ -173,7 +191,8 @@ class DownLoader():
 
         count = 0
         for i in range(self.threadNumber):
-            count = self.threadControl["thread"][i]["current"] + count
+            dataId = self.threadControl["thread"][i]["dataId"]
+            count = self.threadControl["data"][dataId]["current"] + count
 
         print("percentage: ", count/self.fileLength, "count: ", count/(1024*1024), "M")
 
@@ -192,7 +211,14 @@ class DownLoader():
     def mergeFile(self):
         print("start to merge file")
         file = open(self.destFile, "wb")
+        """
         for i in range(self.threadNumber):
+            temFile = open("thread_"+str(i), "rb")
+            file.write(temFile.read())
+            temFile.close()
+        """
+        for i in self.threadControl["merge"]:
+            print(i)
             temFile = open("thread_"+str(i), "rb")
             file.write(temFile.read())
             temFile.close()
